@@ -1,1 +1,105 @@
-<REPLACED WITH LONG CLOUDBUILD YAML CONTENT ABOVE>
+options:
+  logging: CLOUD_LOGGING_ONLY
+  pool:
+    name: projects/$PROJECT_ID/locations/$REGION/workerPools/<YOUR_PRIVATE_POOL_NAME>
+
+substitutions:
+  _BUCKET: "<YOUR_BUCKET>"              # GCS bucket with staged binaries
+  _PACKER_VERSION: "1.14.1"             # 5) pinned
+  _GCP_PLUGIN_VERSION: "1.2.2"          # 5) pinned
+  _REGION: "asia-southeast1"
+  _ZONE: "asia-southeast1-b"
+  _NETWORK: "default"
+  _SUBNETWORK: ""
+  _SOURCE_IMAGE_FAMILY: "debian-12"
+
+steps:
+# 6) Fetch packer + plugin from GCS (offline-friendly)
+- name: gcr.io/cloud-builders/gsutil
+  id: "Fetch Packer"
+  entrypoint: "bash"
+  args:
+    - "-c"
+    - |
+      set -euxo pipefail
+      mkdir -p /workspace/bin /workspace/plugins
+      gsutil cp gs://${_BUCKET}/packer/packer_${_PACKER_VERSION}_linux_amd64.zip /workspace/
+      unzip -q /workspace/packer_${_PACKER_VERSION}_linux_amd64.zip -d /workspace/bin
+      chmod +x /workspace/bin/packer
+
+- name: gcr.io/cloud-builders/gsutil
+  id: "Fetch googlecompute plugin"
+  entrypoint: "bash"
+  args:
+    - "-c"
+    - |
+      set -euxo pipefail
+      gsutil cp gs://${_BUCKET}/plugins/packer-plugin-googlecompute_v${_GCP_PLUGIN_VERSION}_x5.0_linux_amd64.zip /workspace/
+      unzip -q /workspace/packer-plugin-googlecompute_v${_GCP_PLUGIN_VERSION}_x5.0_linux_amd64.zip -d /workspace/plugins
+      # Packer discovers plugins via PACKER_PLUGIN_PATH; the binary name must start with packer-plugin-*
+      ls -l /workspace/plugins
+
+# 1) Init/validate/build (no internet)
+- name: gcr.io/cloud-builders/gcloud
+  id: "Packer build"
+  entrypoint: "bash"
+  env:
+    - "PACKER_PLUGIN_PATH=/workspace/plugins"
+  args:
+    - "-c"
+    - |
+      set -euxo pipefail
+      /workspace/bin/packer version
+      cd packer
+      /workspace/bin/packer init -upgrade=false .
+      /workspace/bin/packer validate \
+        -var "project_id=$PROJECT_ID" \
+        -var "region=${_REGION}" \
+        -var "zone=${_ZONE}" \
+        -var "network=${_NETWORK}" \
+        -var "subnetwork=${_SUBNETWORK}" \
+        -var "source_image_family=${_SOURCE_IMAGE_FAMILY}" \
+        .
+      /workspace/bin/packer build \
+        -timestamp-ui \
+        -var "project_id=$PROJECT_ID" \
+        -var "region=${_REGION}" \
+        -var "zone=${_ZONE}" \
+        -var "network=${_NETWORK}" \
+        -var "subnetwork=${_SUBNETWORK}" \
+        -var "source_image_family=${_SOURCE_IMAGE_FAMILY}" \
+        .
+
+# 7) Lifecycle: deprecate >=3 months, obsolete >=6 months, delete obsolete >6 months
+- name: gcr.io/cloud-builders/gcloud
+  id: "Lifecycle: deprecate/obsolete/cleanup"
+  entrypoint: "bash"
+  args:
+    - "-c"
+    - |
+      set -euo pipefail
+      FAMILY="gcp-goldenimage-baseline"
+      NOW=$(date -u +%s)
+
+      # Fetch all images matching naming pattern (project scope)
+      IMAGES_JSON=$(gcloud compute images list --filter="name~'^gcp-goldenimage-baseline-[0-9]{8}$'" --format=json)
+
+      echo "$IMAGES_JSON" | jq -r '.[] | [.name, .creationTimestamp] | @tsv' | while IFS=$'\t' read -r NAME CREATED; do
+        CT=$(date -u -d "$CREATED" +%s)
+        AGE_DAYS=$(( (NOW - CT) / 86400 ))
+
+        # Deprecate at 90 days, obsolete at 180 days
+        if [ $AGE_DAYS -ge 180 ]; then
+          echo "Marking $NAME OBSOLETE and scheduling deletion"
+          gcloud compute images deprecate "$NAME" --state=OBSOLETE --quiet
+          # Optional cleanup: delete images older than 180d (already obsolete)
+          gcloud compute images delete "$NAME" --quiet || true
+        elif [ $AGE_DAYS -ge 90 ]; then
+          echo "Marking $NAME DEPRECATED"
+          gcloud compute images deprecate "$NAME" --state=DEPRECATED --quiet
+        else
+          echo "Leaving $NAME active (age ${AGE_DAYS}d)"
+        fi
+      done
+
+timeout: 3600s
